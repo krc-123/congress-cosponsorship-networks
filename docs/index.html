@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cosponsorship network</title>
+<meta name="description" content="Who signs maternal health, deaf and hard of hearing, and disability bills together in the 119th Congress">
+<style>
+  :root { --bg:#ffffff; --fg:#1a1a1a; --muted:#5f6368; --panel:#f4f5f7; --line:#d9dce1; --dem:#2166ac; --rep:#b2182b; --ind:#4d9221; --accent:#7a0177; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#121417; --fg:#e8eaed; --muted:#9aa0a6; --panel:#1c1f24; --line:#30343a; } }
+  :root[data-theme="dark"] { --bg:#121417; --fg:#e8eaed; --muted:#9aa0a6; --panel:#1c1f24; --line:#30343a; }
+  * { box-sizing:border-box }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  header { padding:16px 16px 8px; }
+  h1 { font-size:1.25rem; margin:0 0 4px; }
+  p.sub { margin:0; color:var(--muted); font-size:.92rem; max-width:70ch; }
+  .controls { display:flex; flex-wrap:wrap; gap:10px 16px; padding:10px 16px; background:var(--panel); border-top:1px solid var(--line); border-bottom:1px solid var(--line); align-items:center; }
+  .controls label { display:flex; flex-direction:column; font-size:.8rem; color:var(--muted); gap:3px; }
+  select, input[type=search] { font:inherit; padding:5px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); min-width:150px; }
+  input[type=range] { width:150px }
+  .legend { display:flex; gap:14px; font-size:.85rem; align-items:center; margin-left:auto; }
+  .legend span::before { content:""; display:inline-block; width:11px; height:11px; border-radius:50%; margin-right:5px; vertical-align:-1px; }
+  .legend .d::before { background:var(--dem) } .legend .r::before { background:var(--rep) } .legend .i::before { background:var(--ind) }
+  #wrap { position:relative; }
+  svg { width:100%; height:calc(100vh - 170px); min-height:480px; display:block; background:var(--bg); }
+  #tip { position:absolute; pointer-events:none; background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font-size:.85rem; max-width:280px; display:none; box-shadow:0 4px 14px rgba(0,0,0,.15); }
+  #tip b { display:block; margin-bottom:2px }
+  #status { padding:6px 16px; font-size:.85rem; color:var(--muted); }
+  a { color:var(--accent) }
+  @media (max-width:600px){ .legend{ margin-left:0 } select, input[type=search]{ min-width:120px } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Who signs these bills together, 119th Congress</h1>
+  <p class="sub">Each dot is a member of Congress; a line means they signed at least the chosen number of bills in common on the selected topic. Size is how many of the topic's bills they signed. Hover for counts and social handles; click to pin a member's neighbors. Data: govinfo BILLSTATUS bulk data, see the repository README.</p>
+</header>
+<div class="controls" role="group" aria-label="Filters">
+  <label>Chamber <select id="chamber"><option>House</option><option>Senate</option></select></label>
+  <label>Topic <select id="topic"><option value="maternal">Maternal health</option><option value="disability">Disability</option><option value="deaf_hoh">Deaf and hard of hearing</option></select></label>
+  <label>Minimum shared bills <span><input id="minw" type="range" min="1" max="8" value="2"> <output id="minwv">2</output></span></label>
+  <label>State <select id="state"><option value="">All states</option></select></label>
+  <label>Find a member <input id="q" type="search" placeholder="Last name"></label>
+  <div class="legend" aria-hidden="true"><span class="d">Democrat</span><span class="r">Republican</span><span class="i">Independent</span></div>
+</div>
+<div id="status" aria-live="polite"></div>
+<div id="wrap"><svg id="g" role="img" aria-label="Force-directed network of members who cosponsor bills together"></svg><div id="tip"></div></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.9.0/d3.min.js"></script>
+<script>
+(async function () {
+  const PAL = { D: '#2166ac', R: '#b2182b', I: '#4d9221', ID: '#4d9221', L: '#4d9221' };
+  const TOPIC_LABEL = { maternal: 'Maternal health', disability: 'Disability', deaf_hoh: 'Deaf and hard of hearing' };
+  let data;
+  try { data = await (await fetch('graph.json')).json(); }
+  catch (e) { document.getElementById('status').textContent = 'Could not load graph.json. Serve this folder over HTTP (for example GitHub Pages) rather than opening the file directly.'; return; }
+  const nodesById = new Map(data.nodes.map(n => [n.id, n]));
+  const states = [...new Set(data.nodes.map(n => n.state))].sort();
+  const stateSel = document.getElementById('state');
+  states.forEach(s => { const o = document.createElement('option'); o.value = s; o.textContent = s; stateSel.appendChild(o); });
+
+  const svg = d3.select('#g'); const tip = document.getElementById('tip'); const status = document.getElementById('status');
+  const gRoot = svg.append('g');
+  svg.call(d3.zoom().scaleExtent([0.3, 6]).on('zoom', ev => gRoot.attr('transform', ev.transform)));
+  let sim, pinned = null;
+
+  function render() {
+    const chamber = document.getElementById('chamber').value, topic = document.getElementById('topic').value;
+    const minw = +document.getElementById('minw').value, st = stateSel.value, q = document.getElementById('q').value.trim().toLowerCase();
+    document.getElementById('minwv').textContent = minw;
+    const edges = data.edges.filter(e => e.chamber === chamber && e.topic === topic && e.weight >= minw)
+      .map(e => ({ source: e.source, target: e.target, weight: e.weight }));
+    const ids = new Set(); edges.forEach(e => { ids.add(e.source); ids.add(e.target); });
+    const nodes = data.nodes.filter(n => n.chamber === chamber && n[topic] > 0 && (ids.has(n.id) || minw <= 1)).map(n => Object.assign({}, n));
+    const nodeSet = new Set(nodes.map(n => n.id));
+    const links = edges.filter(e => nodeSet.has(e.source) && nodeSet.has(e.target));
+    status.textContent = `${nodes.length} members, ${links.length} ties, ${TOPIC_LABEL[topic]}, ${chamber}${st ? ', highlighting ' + st : ''}`;
+    gRoot.selectAll('*').remove();
+    const { width, height } = svg.node().getBoundingClientRect();
+    const maxW = d3.max(links, l => l.weight) || 1;
+    const link = gRoot.append('g').attr('stroke', 'currentColor').attr('stroke-opacity', 0.18).selectAll('line').data(links).join('line')
+      .attr('stroke-width', l => 0.4 + 2.6 * l.weight / maxW);
+    const r = n => 3 + Math.sqrt(n[topic]) * 2.4;
+    const node = gRoot.append('g').selectAll('circle').data(nodes).join('circle')
+      .attr('r', r).attr('fill', n => PAL[n.party] || '#888').attr('stroke', '#fff').attr('stroke-width', 1)
+      .attr('opacity', n => (st && n.state !== st) ? 0.18 : (q && !n.name.toLowerCase().includes(q)) ? 0.18 : 0.92)
+      .call(d3.drag().on('start', (ev, d) => { if (!ev.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+        .on('drag', (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
+        .on('end', (ev, d) => { if (!ev.active) sim.alphaTarget(0); d.fx = null; d.fy = null; }));
+    const label = gRoot.append('g').attr('font-size', 10).attr('fill', 'currentColor').selectAll('text')
+      .data(nodes.filter(n => n[topic] >= d3.quantile(nodes.map(x => x[topic]).sort(d3.ascending), 0.95) || (q && n.name.toLowerCase().includes(q))))
+      .join('text').text(n => n.name.replace(/^(Rep\.|Sen\.|Del\.|Rescom\.)\s*/, '').split(',')[0]).attr('dx', 7).attr('dy', 3);
+    node.on('mousemove', (ev, n) => {
+      tip.style.display = 'block'; tip.style.left = (ev.offsetX + 14) + 'px'; tip.style.top = (ev.offsetY + 14) + 'px';
+      tip.innerHTML = `<b>${n.name}</b>${n.party} ${n.state}${n.district ? '-' + n.district : ''}<br>Maternal ${n.maternal} · Disability ${n.disability} · Deaf/HoH ${n.deaf_hoh}<br>Co-signers from the other party: ${Math.round(n.cross * 100)}%` +
+        (n.instagram ? `<br>Instagram ${n.instagram}` : '') + (n.x ? `<br>X ${n.x}` : '');
+    }).on('mouseleave', () => { tip.style.display = 'none'; })
+      .on('click', (ev, n) => { pinned = pinned === n.id ? null : n.id; highlight(); });
+    function highlight() {
+      if (!pinned) { node.attr('opacity', 0.92); link.attr('stroke-opacity', 0.18); return; }
+      const nb = new Set([pinned]); links.forEach(l => { const s = l.source.id || l.source, t = l.target.id || l.target; if (s === pinned) nb.add(t); if (t === pinned) nb.add(s); });
+      node.attr('opacity', n => nb.has(n.id) ? 0.95 : 0.12);
+      link.attr('stroke-opacity', l => ((l.source.id || l.source) === pinned || (l.target.id || l.target) === pinned) ? 0.6 : 0.04);
+    }
+    if (sim) sim.stop();
+    sim = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(links).id(d => d.id).distance(l => 30 + 90 * (1 - l.weight / maxW)).strength(l => 0.02 + 0.18 * l.weight / maxW))
+      .force('charge', d3.forceManyBody().strength(-90).distanceMax(400))
+      .force('collide', d3.forceCollide().radius(n => r(n) + 1.5))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .on('tick', () => {
+        link.attr('x1', l => l.source.x).attr('y1', l => l.source.y).attr('x2', l => l.target.x).attr('y2', l => l.target.y);
+        node.attr('cx', n => n.x).attr('cy', n => n.y);
+        label.attr('x', n => n.x).attr('y', n => n.y);
+      })
+      .on('end', () => {
+        // zoom to fit once the layout settles
+        const xs = nodes.map(n => n.x), ys = nodes.map(n => n.y);
+        const x0 = d3.min(xs) - 30, x1 = d3.max(xs) + 30, y0 = d3.min(ys) - 30, y1 = d3.max(ys) + 30;
+        const k = Math.min(0.95 * width / (x1 - x0), 0.95 * height / (y1 - y0), 2.5);
+        svg.transition().duration(600).call(d3.zoom().scaleExtent([0.3, 6]).on('zoom', ev => gRoot.attr('transform', ev.transform)).transform,
+          d3.zoomIdentity.translate(width / 2, height / 2).scale(k).translate(-(x0 + x1) / 2, -(y0 + y1) / 2));
+      });
+  }
+  ['chamber', 'topic', 'minw', 'state', 'q'].forEach(id => document.getElementById(id).addEventListener('input', render));
+  render();
+})();
+</script>
+</body>
+</html>
